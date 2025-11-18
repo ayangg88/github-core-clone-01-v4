@@ -1,0 +1,1 @@
+{"description":"GitHub-compatible git forge: smart-HTTP git, REST v3, GraphQL and MCP in one process, stdlib only.","engines":{"node":">=22.18"},"main":"main.ts","name":"github-core-clone-01-v4","private":true,"scripts":{"check":"tsc --noEmit","start":"node main.ts"},"type":"module","version":"1.0.0"}
