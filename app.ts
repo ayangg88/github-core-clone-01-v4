@@ -408,6 +408,7 @@ export interface Repo {
   version: number;
   adCache: Buffer | null;
   adVersion: number;
+  adKey: string;
   packCache: Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>;
 }
 
@@ -445,6 +446,7 @@ export class Store {
       version: 0,
       adCache: null,
       adVersion: -1,
+      adKey: '',
       packCache: new Map(),
     };
     this.reposByKey.set(this.key(owner, name), repo);
@@ -663,8 +665,17 @@ export interface FetchPlan {
   unshallow: string[];
 }
 
-// Compute the objects a fetch must send: walk from `wants`, never crossing
-// `haves`, and stop at `depth` generations (boundary commits become shallow).
+// Compute the objects a fetch must send: walk from `wants`, never re-sending
+// anything the client already holds, and stop at `depth` generations
+// (boundary commits become shallow).
+//
+// The client's `have` lines name commits it holds, but a commit named in the
+// request's `shallow` list is only a boundary: the client holds the commit
+// itself, not its parents. So the held set is the closure of the haves with
+// the walk stopped at shallow-listed commits, plus those commits' trees and
+// blobs. The walk still descends through a held want (a deepen asks for the
+// parent of a commit the client already has), and only commits actually sent
+// can become new shallow boundaries.
 export function planFetch(
   repo: Repo,
   wants: string[],
@@ -672,10 +683,41 @@ export function planFetch(
   depth: number | null,
   oldShallow: string[],
 ): FetchPlan {
-  const haveSet = commitClosure(repo, haves);
+  // Commits the client fully holds.
+  const haveCommits = new Set<string>();
+  const hstack = [...haves];
+  while (hstack.length > 0) {
+    const oid = hstack.pop() as string;
+    if (haveCommits.has(oid)) continue;
+    const c = getCommit(repo, oid);
+    if (!c) continue;
+    haveCommits.add(oid);
+    if (oldShallow.includes(oid)) continue;
+    for (const p of c.parents) hstack.push(p);
+  }
+  // Every object reachable from a held commit (its trees and blobs too).
+  const haveObjects = new Set<string>();
+  const ostack: string[] = [];
+  for (const oid of haveCommits) {
+    haveObjects.add(oid);
+    const c = getCommit(repo, oid);
+    if (c) ostack.push(c.tree);
+  }
+  while (ostack.length > 0) {
+    const oid = ostack.pop() as string;
+    if (haveObjects.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    haveObjects.add(oid);
+    if (obj.type === 'tree') {
+      const entries = getTree(repo, oid);
+      if (entries) for (const e of entries) ostack.push(e.oid);
+    }
+  }
+  // Walk from the wants by generation.
   const include = new Set<string>(); // commits to send
+  const extra = new Set<string>(); // non-commit wants (tags, trees, blobs)
   const boundary = new Set<string>();
-  // BFS by generation from the wants.
   const queue: Array<{ oid: string; gen: number }> = wants.map((oid) => ({ oid, gen: 0 }));
   const seenGen = new Map<string, number>();
   while (queue.length > 0) {
@@ -683,9 +725,29 @@ export function planFetch(
     const prev = seenGen.get(oid);
     if (prev !== undefined && prev <= gen) continue;
     seenGen.set(oid, gen);
-    if (haveSet.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    if (obj.type !== 'commit') {
+      if (obj.type === 'tag') {
+        extra.add(oid);
+        const text = obj.full.toString('utf8', obj.full.indexOf(0) + 1);
+        const m = /^object ([0-9a-f]{40})$/m.exec(text);
+        if (m) queue.push({ oid: m[1], gen });
+      } else {
+        extra.add(oid);
+      }
+      continue;
+    }
     const c = getCommit(repo, oid);
     if (!c) continue;
+    if (haveCommits.has(oid)) {
+      // Held, but still descend below it: a deepen asks for the parent of a
+      // commit the client already has.
+      if (depth === null || gen + 1 < depth) {
+        for (const p of c.parents) queue.push({ oid: p, gen: gen + 1 });
+      }
+      continue;
+    }
     include.add(oid);
     if (depth !== null && gen + 1 >= depth) {
       boundary.add(oid);
@@ -695,8 +757,8 @@ export function planFetch(
   }
   const shallow = [...boundary];
   const unshallow = oldShallow.filter((oid) => include.has(oid) && !boundary.has(oid));
-  // Collect trees + blobs for every included commit.
-  const oids = new Set<string>();
+  // Trees and blobs for every included commit, minus anything held.
+  const oids = new Set<string>(extra);
   const stack: string[] = [];
   for (const oid of include) {
     oids.add(oid);
@@ -705,7 +767,7 @@ export function planFetch(
   }
   while (stack.length > 0) {
     const oid = stack.pop() as string;
-    if (oids.has(oid)) continue;
+    if (oids.has(oid) || haveObjects.has(oid)) continue;
     const obj = repo.objects.get(oid);
     if (!obj) continue;
     oids.add(oid);
@@ -713,6 +775,9 @@ export function planFetch(
       const entries = getTree(repo, oid);
       if (entries) for (const e of entries) stack.push(e.oid);
     }
+  }
+  for (const oid of [...oids]) {
+    if (haveObjects.has(oid)) oids.delete(oid);
   }
   const objects: GitObject[] = [];
   for (const oid of include) {
@@ -846,7 +911,10 @@ export function v0Advertisement(repo: Repo): Buffer {
 // The ls-refs response for a v2 upload-pack POST: ref lines, then flush.
 // No version line: the client's parser treats every line as a ref.
 export function lsRefsResponse(repo: Repo, prefixes: string[], wantPeel: boolean, wantSymrefs: boolean): Buffer {
-  if (repo.adCache !== null && repo.adVersion === repo.version) return repo.adCache;
+  // The advertisement is cached per option set: a prefixed call must not
+  // receive the unfiltered list cached by an earlier call.
+  const cacheKey = `${prefixes.join(',')}|${wantPeel ? 'p' : ''}|${wantSymrefs ? 's' : ''}`;
+  if (repo.adCache !== null && repo.adVersion === repo.version && repo.adKey === cacheKey) return repo.adCache;
   const lines: string[] = [];
   const refs = [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
   const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
@@ -876,6 +944,7 @@ export function lsRefsResponse(repo: Repo, prefixes: string[], wantPeel: boolean
   const out = pktLines([...lines, 'flush']);
   repo.adCache = out;
   repo.adVersion = repo.version;
+  repo.adKey = cacheKey;
   return out;
 }
 
@@ -1156,7 +1225,10 @@ export function commitJson(repo: Repo, oid: string): Record<string, unknown> | n
 function linkHeader(req: http.IncomingMessage, page: number, perPage: number, total: number): string {
   const pages = Math.max(1, Math.ceil(total / perPage));
   const url = new URL(req.url ?? '/', 'http://x');
-  const base = url.pathname;
+  // Link relations must be absolute: the client rejects a relative next URL
+  // at its same-origin gate.
+  const host = req.headers.host ?? '127.0.0.1';
+  const base = `http://${host}${url.pathname}`;
   const mk = (p: number): string => `${base}?per_page=${perPage}&page=${p}`;
   const links: string[] = [];
   if (page < pages) links.push(`<${mk(page + 1)}>; rel="next"`);
@@ -1741,56 +1813,12 @@ export async function handleRest(req: http.IncomingMessage, res: http.ServerResp
     }
     if (rest.length === 3 && rest[2] === 'merge' && method === 'PUT') {
       if (!pull) { jsonError(res, 404, 'Not Found'); return; }
-      if (pull.merged || pull.state !== 'open') {
-        jsonError(res, 405, 'pull request is already merged or closed');
+      const result = mergePull(store, repo, pull);
+      if (!result.ok) {
+        jsonError(res, result.status, result.message);
         return;
       }
-      const base = mergeBase(repo, pull.headSha, pull.baseSha);
-      const baseTipTree = getCommit(repo, pull.baseSha)?.tree ?? '';
-      const headTree = getCommit(repo, pull.headSha)?.tree ?? '';
-      const mergeBaseTree = base ? (getCommit(repo, base)?.tree ?? '') : '';
-      const headDiff = diffTrees(repo, mergeBaseTree, headTree);
-      const baseDiff = diffTrees(repo, mergeBaseTree, baseTipTree);
-      const headFlat = new Map<string, { mode: string; oid: string }>();
-      const baseFlat = new Map<string, { mode: string; oid: string }>();
-      const mbFlat = new Map<string, { mode: string; oid: string }>();
-      if (mergeBaseTree) flattenTree(repo, mergeBaseTree, '', mbFlat);
-      if (headTree) flattenTree(repo, headTree, '', headFlat);
-      if (baseTipTree) flattenTree(repo, baseTipTree, '', baseFlat);
-      // Conflict: a path changed on both sides since the merge-base, to
-      // different content.
-      let conflict = false;
-      for (const d of headDiff) {
-        const onBase = baseDiff.find((x) => x.filename === d.filename);
-        if (!onBase) continue;
-        const h = headFlat.get(d.filename);
-        const b = baseFlat.get(d.filename);
-        if ((h?.oid ?? null) !== (b?.oid ?? null)) { conflict = true; break; }
-      }
-      if (conflict) {
-        jsonError(res, 405, 'merge conflict');
-        return;
-      }
-      // Squash: base tip tree with the head's changes applied.
-      const result = new Map(baseFlat);
-      for (const d of headDiff) {
-        if (d.status === 'removed') result.delete(d.filename);
-        else {
-          const h = headFlat.get(d.filename);
-          if (h) result.set(d.filename, h);
-        }
-      }
-      const treeOid = buildTree(repo, result);
-      const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
-      const commitOid = makeCommit(repo, treeOid, [pull.baseSha], message);
-      repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
-      pull.state = 'closed';
-      pull.merged = true;
-      pull.mergedAt = NOW_ISO;
-      pull.mergeCommitSha = commitOid;
-      pull.updatedAt = NOW_ISO;
-      store.bump(repo);
-      sendJson(res, 200, { merged: true, sha: commitOid, message }, scopes);
+      sendJson(res, 200, { merged: true, sha: result.sha, message: result.message }, scopes);
       return;
     }
     jsonError(res, 404, 'Not Found');
@@ -1808,8 +1836,12 @@ export function mergePull(store: Store, repo: Repo, pull: Pull): { ok: boolean; 
   if (pull.merged || pull.state !== 'open') {
     return { ok: false, status: 405, message: 'pull request is already merged or closed' };
   }
-  const base = mergeBase(repo, pull.headSha, pull.baseSha);
-  const baseTipTree = getCommit(repo, pull.baseSha)?.tree ?? '';
+  // The base tip is live: another PR may have moved the base branch since
+  // this PR was opened, and the merge (and its conflict test) must use the
+  // branch as it stands now, not the sha recorded at creation.
+  const liveBaseSha = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
+  const base = mergeBase(repo, pull.headSha, liveBaseSha);
+  const baseTipTree = getCommit(repo, liveBaseSha)?.tree ?? '';
   const headTree = getCommit(repo, pull.headSha)?.tree ?? '';
   const mergeBaseTree = base ? (getCommit(repo, base)?.tree ?? '') : '';
   const headDiff = diffTrees(repo, mergeBaseTree, headTree);
@@ -1837,7 +1869,7 @@ export function mergePull(store: Store, repo: Repo, pull: Pull): { ok: boolean; 
   }
   const treeOid = buildTree(repo, result);
   const message = `Merge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`;
-  const commitOid = makeCommit(repo, treeOid, [pull.baseSha], message);
+  const commitOid = makeCommit(repo, treeOid, [liveBaseSha], message);
   repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
   pull.state = 'closed';
   pull.merged = true;
@@ -1850,8 +1882,9 @@ export function mergePull(store: Store, repo: Repo, pull: Pull): { ok: boolean; 
 
 export function pullMergeable(repo: Repo, pull: Pull): boolean {
   if (pull.merged || pull.state !== 'open') return false;
-  const base = mergeBase(repo, pull.headSha, pull.baseSha);
-  const baseTipTree = getCommit(repo, pull.baseSha)?.tree ?? '';
+  const liveBaseSha = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
+  const base = mergeBase(repo, pull.headSha, liveBaseSha);
+  const baseTipTree = getCommit(repo, liveBaseSha)?.tree ?? '';
   const headTree = getCommit(repo, pull.headSha)?.tree ?? '';
   const mergeBaseTree = base ? (getCommit(repo, base)?.tree ?? '') : '';
   const headDiff = diffTrees(repo, mergeBaseTree, headTree);
@@ -2040,6 +2073,10 @@ export function issueGql(issue: Issue, repo: Repo): Record<string, unknown> {
 
 export function pullGql(pull: Pull, repo: Repo): Record<string, unknown> {
   const state = pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED';
+  const base = mergeBase(repo, pull.headSha, pull.baseSha);
+  const baseTree = base ? (getCommit(repo, base)?.tree ?? '') : '';
+  const headTree = getCommit(repo, pull.headSha)?.tree ?? '';
+  const diff = diffTrees(repo, baseTree, headTree);
   return {
     id: globalId('pull', pull.id),
     databaseId: pull.id,
@@ -2057,6 +2094,17 @@ export function pullGql(pull: Pull, repo: Repo): Record<string, unknown> {
     mergeable: pullMergeable(repo, pull),
     merged: pull.merged,
     mergeCommit: pull.mergeCommitSha ? { oid: pull.mergeCommitSha } : null,
+    files: {
+      nodes: diff.map((d) => ({
+        path: d.filename,
+        filename: d.filename,
+        status: d.status.toUpperCase(),
+        additions: d.additions,
+        deletions: d.deletions,
+        changes: d.changes,
+      })),
+      totalCount: diff.length,
+    },
     repository: { name: repo.name, nameWithOwner: `${repo.owner}/${repo.name}` },
     url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}`,
   };
@@ -2209,109 +2257,109 @@ export function inputOf(query: string): string | null {
   return null;
 }
 
-export function executeGraphQL(store: Store, rawQuery: string, variables: Record<string, unknown>): { data?: Record<string, unknown> | null; errors?: Array<{ message: string }> } {
-  const query = substituteVariables(rawQuery, variables);
-  const compact = query.replace(/#[^\n]*/g, ' ');
-  const isMutation = /^\s*mutation\b/.test(compact);
-  const root = rootField(compact);
+// One top-level field of an operation, with its alias (when written as
+// `Alias: field`), its argument list and its selection set.
+export interface TopField {
+  alias: string | null;
+  name: string;
+  args: string | null;
+  selStart: number;
+  selEnd: number;
+}
 
-  // Introspection: __type(name: "...").
-  const typeMatch = /__type\s*\(\s*name\s*:\s*"([^"]+)"\s*\)/.exec(compact);
-  if (typeMatch) {
-    const name = typeMatch[1];
-    if (name === 'SearchType') {
-      return { data: { __type: { name, kind: 'ENUM', enumValues: [{ name: 'ISSUE' }, { name: 'REPOSITORY' }, { name: 'USER' }] } } };
+// Parse the top-level fields of an operation body (which starts with '{').
+// Handles aliases, argument lists, nested selection sets and inline
+// fragments; a document may hold several root fields in one body.
+export function parseTopFields(body: string): TopField[] {
+  const fields: TopField[] = [];
+  const n = body.length;
+  let i = 1; // skip the operation's opening brace
+  const skipWs = (): void => {
+    while (i < n && /[\s,]/.test(body[i])) i += 1;
+  };
+  const readWord = (): string | null => {
+    const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(body.slice(i));
+    if (!m) return null;
+    i += m[0].length;
+    return m[0];
+  };
+  const skipBalanced = (open: string, close: string): number => {
+    let depth = 0;
+    while (i < n) {
+      const ch = body[i];
+      if (ch === '"') {
+        i += 1;
+        while (i < n && body[i] !== '"') i += body[i] === '\\' ? 2 : 1;
+        i += 1;
+        continue;
+      }
+      if (ch === open) depth += 1;
+      else if (ch === close) {
+        depth -= 1;
+        if (depth === 0) { i += 1; return i; }
+      }
+      i += 1;
     }
-    const fields = TYPE_FIELDS[name];
-    if (!fields) return { data: { __type: null } };
-    return {
-      data: {
-        __type: {
-          name,
-          kind: 'OBJECT',
-          fields: [...fields].map((f) => ({ name: f })),
-        },
-      },
-    };
+    return i;
+  };
+  while (i < n) {
+    skipWs();
+    if (i >= n || body[i] === '}') break;
+    if (body[i] === '.' && body.startsWith('...', i)) {
+      i += 3;
+      skipWs();
+      if (body.startsWith('on ', i)) {
+        i += 3;
+        readWord();
+        skipWs();
+      }
+      if (body[i] === '{') skipBalanced('{', '}');
+      continue;
+    }
+    const word1 = readWord();
+    if (!word1) { i += 1; continue; }
+    skipWs();
+    let alias: string | null = null;
+    let name = word1;
+    if (body[i] === ':') {
+      alias = word1;
+      i += 1;
+      skipWs();
+      const word2 = readWord();
+      if (!word2) break;
+      name = word2;
+      skipWs();
+    }
+    let args: string | null = null;
+    if (body[i] === '(') {
+      const start = i;
+      skipBalanced('(', ')');
+      args = body.slice(start + 1, i - 1);
+      skipWs();
+    }
+    let selStart = -1;
+    let selEnd = -1;
+    if (body[i] === '{') {
+      selStart = i;
+      selEnd = skipBalanced('{', '}');
+      skipWs();
+    }
+    fields.push({ alias, name, args, selStart, selEnd });
   }
+  return fields;
+}
 
-  if (!isMutation) {
-    // viewer { ... }
-    if (root === 'viewer') {
-      const viewerIdx = compact.indexOf('viewer');
-      const brace = compact.indexOf('{', viewerIdx);
-      const fields = brace >= 0 ? topFields(compact, brace) : [];
-      const bad = fields.find((f) => !USER_FIELDS.has(f));
-      if (bad) {
-        return { data: null, errors: [{ message: `Cannot query field "${bad}" on type "User".` }] };
-      }
-      return {
-        data: {
-          viewer: {
-            login: VIEWER.login,
-            id: VIEWER.id,
-            name: VIEWER.name,
-            email: VIEWER.email,
-            url: `https://github.com/${VIEWER.login}`,
-          },
-        },
-      };
-    }
-    // node(id: "...") { ... on Repository { ... } }
-    if (root === 'node') {
-      const nodeArgs = argsOf(compact, 'node');
-      if (nodeArgs) {
-        const id = argString(nodeArgs, 'id');
-        const decoded = id ? decodeGlobalId(id) : null;
-        if (decoded && decoded.kind === 'repo') {
-          const repo = store.reposById.get(decoded.num);
-          if (!repo) return { data: { node: null } };
-          return { data: { node: repoGql(repo, compact) } };
-        }
-        if (decoded && decoded.kind === 'issue') {
-          const found = findIssueById(store, decoded.num);
-          if (!found) return { data: { node: null } };
-          return { data: { node: issueGql(found.issue, found.repo) } };
-        }
-        if (decoded && decoded.kind === 'pull') {
-          const found = findPullById(store, decoded.num);
-          if (!found) return { data: { node: null } };
-          return { data: { node: pullGql(found.pull, found.repo) } };
-        }
-        return { data: { node: null } };
-      }
-    }
-    // repository(owner: "...", name: "...") { ... }
-    if (root === 'repository') {
-      const repoArgs = argsOf(compact, 'repository');
-      if (repoArgs) {
-        const owner = argString(repoArgs, 'owner');
-        const name = argString(repoArgs, 'name');
-        const repo = owner && name ? store.get(owner, name) : undefined;
-        if (!repo) return { data: { repository: null } };
-        // Validate the top-level fields requested on the repository.
-        const brace = compact.indexOf('{', compact.indexOf('repository'));
-        const fields = brace >= 0 ? topFields(compact, brace) : [];
-        const bad = fields.find((f) => !REPO_FIELDS.has(f) && f !== '__typename');
-        if (bad) {
-          return { data: null, errors: [{ message: `Cannot query field "${bad}" on type "Repository".` }] };
-        }
-        return { data: { repository: repoGql(repo, compact) } };
-      }
-    }
-    return { data: null, errors: [{ message: 'Unknown query' }] };
-  }
-
-  // Mutations.
-  const inputArgs = inputOf(compact) ?? '';
+// Run one mutation root field. Returns the payload object, or an error list.
+export function executeMutation(store: Store, field: TopField): { payload?: Record<string, unknown>; errors?: Array<{ message: string }> } {
+  const inputArgs = inputOf(field.args ?? '') ?? '';
   const getInput = (name: string): string | null => argString(inputArgs, name);
-  if (root === 'createIssue') {
+  if (field.name === 'createIssue') {
     const repoId = getInput('repositoryId');
     const title = getInput('title') ?? '';
     const body = getInput('body') ?? '';
     const decoded = repoId ? decodeGlobalId(repoId) : null;
     const repo = decoded ? store.reposById.get(decoded.num) : undefined;
-    if (!repo || !title) return { data: null, errors: [{ message: 'createIssue: repository or title missing' }] };
+    if (!repo || !title) return { errors: [{ message: 'createIssue: repository or title missing' }] };
     repo.issueSeq += 1;
     const issue: Issue = {
       id: store.nextId++,
@@ -2326,32 +2374,32 @@ export function executeGraphQL(store: Store, rawQuery: string, variables: Record
       jsonCache: null,
     };
     repo.issues.set(issue.number, issue);
-    return { data: { createIssue: { issue: { number: issue.number, id: globalId('issue', issue.id) } } } };
+    return { payload: { issue: { number: issue.number, id: globalId('issue', issue.id) } } };
   }
-  if (root === 'closeIssue') {
+  if (field.name === 'closeIssue') {
     const issueId = getInput('issueId');
     const decoded = issueId ? decodeGlobalId(issueId) : null;
     const found = decoded ? findIssueById(store, decoded.num) : null;
-    if (!found) return { data: null, errors: [{ message: 'closeIssue: issue not found' }] };
+    if (!found) return { errors: [{ message: 'closeIssue: issue not found' }] };
     found.issue.state = 'closed';
     found.issue.updatedAt = NOW_ISO;
     found.issue.jsonCache = null;
-    return { data: { closeIssue: { issue: { number: found.issue.number, id: globalId('issue', found.issue.id), state: 'CLOSED' } } } };
+    return { payload: { issue: { number: found.issue.number, id: globalId('issue', found.issue.id), state: 'CLOSED' } } };
   }
-  if (root === 'createPullRequest') {
+  if (field.name === 'createPullRequest') {
     const repoId = getInput('repositoryId');
     const baseRef = getInput('baseRefName') ?? '';
     const headRef = getInput('headRefName') ?? '';
     const title = getInput('title') ?? '';
     const decoded = repoId ? decodeGlobalId(repoId) : null;
     const repo = decoded ? store.reposById.get(decoded.num) : undefined;
-    if (!repo || !baseRef || !headRef) return { data: null, errors: [{ message: 'createPullRequest: repository or refs missing' }] };
+    if (!repo || !baseRef || !headRef) return { errors: [{ message: 'createPullRequest: repository or refs missing' }] };
     const headSha = resolveRef(repo, headRef);
     const baseSha = resolveRef(repo, baseRef);
-    if (!headSha || !baseSha) return { data: null, errors: [{ message: 'createPullRequest: head or base branch not found' }] };
+    if (!headSha || !baseSha) return { errors: [{ message: 'createPullRequest: head or base branch not found' }] };
     const existing = [...repo.pulls.values()].find((p) => p.state === 'open' && p.headRef === headRef && p.baseRef === baseRef);
     if (existing) {
-      return { data: { createPullRequest: { pullRequest: { number: existing.number, id: globalId('pull', existing.id), state: 'OPEN', headRefName: existing.headRef, baseRefName: existing.baseRef } } } };
+      return { payload: { pullRequest: { number: existing.number, id: globalId('pull', existing.id), state: 'OPEN', headRefName: existing.headRef, baseRefName: existing.baseRef } } };
     }
     repo.pullSeq += 1;
     const pull: Pull = {
@@ -2371,47 +2419,123 @@ export function executeGraphQL(store: Store, rawQuery: string, variables: Record
       updatedAt: NOW_ISO,
     };
     repo.pulls.set(pull.number, pull);
-    return { data: { createPullRequest: { pullRequest: { number: pull.number, id: globalId('pull', pull.id), state: 'OPEN', headRefName: pull.headRef, baseRefName: pull.baseRef } } } };
+    return { payload: { pullRequest: { number: pull.number, id: globalId('pull', pull.id), state: 'OPEN', headRefName: pull.headRef, baseRefName: pull.baseRef } } };
   }
-  if (root === 'mergePullRequest') {
+  if (field.name === 'mergePullRequest') {
     const prId = getInput('pullRequestId');
     const decoded = prId ? decodeGlobalId(prId) : null;
     const found = decoded ? findPullById(store, decoded.num) : null;
-    if (!found) return { data: null, errors: [{ message: 'mergePullRequest: pull request not found' }] };
+    if (!found) return { errors: [{ message: 'mergePullRequest: pull request not found' }] };
     const result = mergePull(store, found.repo, found.pull);
+    if (!result.ok) return { errors: [{ message: result.message }] };
     const state = found.pull.merged ? 'MERGED' : found.pull.state === 'open' ? 'OPEN' : 'CLOSED';
-    return {
-      data: {
-        mergePullRequest: {
-          pullRequest: {
-            number: found.pull.number,
-            id: globalId('pull', found.pull.id),
-            merged: found.pull.merged,
-            state,
-          },
-        },
-      },
-      ...(result.ok ? {} : { errors: [{ message: result.message }] }),
-    };
+    return { payload: { pullRequest: { number: found.pull.number, id: globalId('pull', found.pull.id), merged: found.pull.merged, state } } };
   }
-  if (root === 'addComment') {
+  if (field.name === 'addComment') {
     const subjectId = getInput('subjectId');
     const body = getInput('body') ?? '';
     const decoded = subjectId ? decodeGlobalId(subjectId) : null;
-    if (!decoded) return { data: null, errors: [{ message: 'addComment: subject not found' }] };
+    if (!decoded) return { errors: [{ message: 'addComment: subject not found' }] };
     if (decoded.kind === 'issue') {
       const found = findIssueById(store, decoded.num);
-      if (!found) return { data: null, errors: [{ message: 'addComment: issue not found' }] };
+      if (!found) return { errors: [{ message: 'addComment: issue not found' }] };
       const comment = { id: store.nextCommentId++, body, createdAt: NOW_ISO, updatedAt: NOW_ISO };
       found.issue.comments.push(comment);
       found.issue.jsonCache = null;
-      return { data: { addComment: { commentEdge: { node: { id: globalId('comment', comment.id), body } } } } };
+      return { payload: { commentEdge: { node: { id: globalId('comment', comment.id), body } } } };
     }
-    return { data: null, errors: [{ message: 'addComment: subject is not commentable' }] };
+    return { errors: [{ message: 'addComment: subject is not commentable' }] };
   }
-  return { data: null, errors: [{ message: 'Unknown mutation' }] };
+  return { errors: [{ message: 'Unknown mutation' }] };
 }
 
+export function executeGraphQL(store: Store, rawQuery: string, variables: Record<string, unknown>): { data?: Record<string, unknown> | null; errors?: Array<{ message: string }> } {
+  const opBrace = rawQuery.indexOf('{');
+  if (opBrace < 0) return { data: null, errors: [{ message: 'Unknown query' }] };
+  const head = rawQuery.slice(0, opBrace);
+  const isMutation = /mutation\b/.test(head);
+  // Substitute variables only inside the operation body. The signature
+  // ($input: CreateIssueInput!) must not be rewritten: it holds braces after
+  // substitution and would break every parser that follows.
+  const body = substituteVariables(rawQuery.slice(opBrace), variables).replace(/#[^\n]*/g, ' ');
+  const fields = parseTopFields(body);
+  const data: Record<string, unknown> = {};
+  const errors: Array<{ message: string }> = [];
+  for (const field of fields) {
+    const key = field.alias ?? field.name;
+    if (field.name === '__type') {
+      const typeName = argString(field.args, 'name');
+      if (!typeName) {
+        errors.push({ message: 'Cannot query __type without a name' });
+        continue;
+      }
+      if (typeName === 'SearchType') {
+        data[key] = { name: typeName, kind: 'ENUM', enumValues: [{ name: 'ISSUE' }, { name: 'REPOSITORY' }, { name: 'USER' }] };
+      } else {
+        const typeFields = TYPE_FIELDS[typeName];
+        if (!typeFields) { data[key] = null; continue; }
+        data[key] = { name: typeName, kind: 'OBJECT', fields: [...typeFields].map((n) => ({ name: n })) };
+      }
+      continue;
+    }
+    if (isMutation) {
+      const out = executeMutation(store, field);
+      if (out.errors) errors.push(...out.errors);
+      else if (out.payload) data[key] = out.payload;
+      continue;
+    }
+    if (field.name === 'viewer') {
+      const sub = field.selStart >= 0 ? topFields(body, field.selStart) : [];
+      const bad = sub.find((x) => !USER_FIELDS.has(x));
+      if (bad) {
+        errors.push({ message: `Cannot query field "${bad}" on type "User".` });
+        continue;
+      }
+      data[key] = {
+        login: VIEWER.login,
+        id: VIEWER.id,
+        name: VIEWER.name,
+        email: VIEWER.email,
+        url: `https://github.com/${VIEWER.login}`,
+      };
+      continue;
+    }
+    if (field.name === 'repository') {
+      const owner = argString(field.args, 'owner');
+      const name = argString(field.args, 'name');
+      const repo = owner && name ? store.get(owner, name) : undefined;
+      if (!repo) { data[key] = null; continue; }
+      const sub = field.selStart >= 0 ? topFields(body, field.selStart) : [];
+      const bad = sub.find((x) => !REPO_FIELDS.has(x) && x !== '__typename');
+      if (bad) {
+        errors.push({ message: `Cannot query field "${bad}" on type "Repository".` });
+        continue;
+      }
+      data[key] = repoGql(repo, body);
+      continue;
+    }
+    if (field.name === 'node') {
+      const id = argString(field.args, 'id');
+      const decoded = id ? decodeGlobalId(id) : null;
+      if (decoded && decoded.kind === 'repo') {
+        const repo = store.reposById.get(decoded.num);
+        data[key] = repo ? repoGql(repo, body) : null;
+      } else if (decoded && decoded.kind === 'issue') {
+        const found = findIssueById(store, decoded.num);
+        data[key] = found ? issueGql(found.issue, found.repo) : null;
+      } else if (decoded && decoded.kind === 'pull') {
+        const found = findPullById(store, decoded.num);
+        data[key] = found ? pullGql(found.pull, found.repo) : null;
+      } else {
+        data[key] = null;
+      }
+      continue;
+    }
+    errors.push({ message: `Cannot query field "${field.name}" on type "Query".` });
+  }
+  if (errors.length > 0) return { data: Object.keys(data).length > 0 ? data : null, errors };
+  return { data };
+}
 export async function handleGraphQL(req: http.IncomingMessage, res: http.ServerResponse, ctx: Ctx): Promise<void> {
   let parsed: unknown;
   try {
