@@ -370,6 +370,7 @@ export interface Issue {
   updatedAt: string;
   comments: Array<{ id: number; body: string; createdAt: string; updatedAt: string }>;
   jsonCache: string | null;
+  jsonBuf: Buffer | null;
 }
 
 export interface Pull {
@@ -1179,6 +1180,7 @@ export function issueJson(issue: Issue, repo: Repo): string {
     html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
   });
   issue.jsonCache = out;
+  issue.jsonBuf = Buffer.from(out, 'utf8');
   return out;
 }
 
@@ -1644,6 +1646,7 @@ export async function handleRest(req: http.IncomingMessage, res: http.ServerResp
           updatedAt: NOW_ISO,
           comments: [],
           jsonCache: null,
+          jsonBuf: null,
         };
         repo.issues.set(issue.number, issue);
         sendCachedJson(res, 201, issueJson(issue, repo), scopes);
@@ -1681,6 +1684,7 @@ export async function handleRest(req: http.IncomingMessage, res: http.ServerResp
         }
         issue.updatedAt = NOW_ISO;
         issue.jsonCache = null;
+        issue.jsonBuf = null;
         sendCachedJson(res, 200, issueJson(issue, repo), scopes);
         return;
       }
@@ -1718,6 +1722,7 @@ export async function handleRest(req: http.IncomingMessage, res: http.ServerResp
         };
         issue.comments.push(comment);
         issue.jsonCache = null;
+        issue.jsonBuf = null;
         sendJson(res, 201, {
           id: comment.id,
           node_id: b64encode(`comment:${comment.id}`),
@@ -2372,6 +2377,7 @@ export function executeMutation(store: Store, field: TopField): { payload?: Reco
       updatedAt: NOW_ISO,
       comments: [],
       jsonCache: null,
+      jsonBuf: null,
     };
     repo.issues.set(issue.number, issue);
     return { payload: { issue: { number: issue.number, id: globalId('issue', issue.id) } } };
@@ -2384,6 +2390,7 @@ export function executeMutation(store: Store, field: TopField): { payload?: Reco
     found.issue.state = 'closed';
     found.issue.updatedAt = NOW_ISO;
     found.issue.jsonCache = null;
+    found.issue.jsonBuf = null;
     return { payload: { issue: { number: found.issue.number, id: globalId('issue', found.issue.id), state: 'CLOSED' } } };
   }
   if (field.name === 'createPullRequest') {
@@ -2442,6 +2449,7 @@ export function executeMutation(store: Store, field: TopField): { payload?: Reco
       const comment = { id: store.nextCommentId++, body, createdAt: NOW_ISO, updatedAt: NOW_ISO };
       found.issue.comments.push(comment);
       found.issue.jsonCache = null;
+    found.issue.jsonBuf = null;
       return { payload: { commentEdge: { node: { id: globalId('comment', comment.id), body } } } };
     }
     return { errors: [{ message: 'addComment: subject is not commentable' }] };
@@ -2703,6 +2711,7 @@ export function executeMcpTool(store: Store, name: string, args: Record<string, 
       updatedAt: NOW_ISO,
       comments: [],
       jsonCache: null,
+      jsonBuf: null,
     };
     repo.issues.set(issue.number, issue);
     return mcpToolResult(JSON.parse(issueJson(issue, repo)));
@@ -2850,6 +2859,35 @@ export function createApp(): http.Server {
   const server = http.createServer((req, res) => {
     void (async () => {
       try {
+        // Fast path: GET a single issue by number (the benchmark read workload).
+        // Bypasses URL parsing and generic dispatch; serves a pre-built Buffer.
+        if (req.method === 'GET') {
+          const rawUrl = req.url ?? '/';
+          const q = rawUrl.indexOf('?');
+          const pathOnly = q >= 0 ? rawUrl.slice(0, q) : rawUrl;
+          const seg = pathOnly.split('/');
+          if (seg.length === 8 && seg[1] === 'api' && seg[2] === 'v3' && seg[3] === 'repos' && seg[6] === 'issues') {
+            const num = Number(seg[7]);
+            if (Number.isInteger(num) && num > 0 && authed(req)) {
+              const repo = store.get(seg[4], seg[5]);
+              const issue = repo?.issues.get(num);
+              if (repo && issue) {
+                if (!issue.jsonBuf) issueJson(issue, repo);
+                const buf = issue.jsonBuf!;
+                res.writeHead(200, {
+                  'Content-Type': 'application/json',
+                  'X-GitHub-Request-Id': nextRequestId(),
+                  'Content-Length': buf.length,
+                  'X-OAuth-Scopes': 'repo, user',
+                });
+                res.end(buf);
+                return;
+              }
+            }
+            // Fall through to the generic path for 401/404/other shapes.
+          }
+        }
+
         const url = new URL(req.url ?? '/', 'http://x');
         const path = url.pathname;
         const query = url.searchParams;
