@@ -209,47 +209,35 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return out;
 }
 
-// Inflate exactly one zlib stream starting at `off`. The pack header gives the
-// uncompressed size, so the stream ends near off + size; binary-search the
-// smallest end that inflates cleanly (inflateSync ignores trailing bytes and
-// throws on truncation, which makes that end exact).
-export function inflateExact(buf: Buffer, off: number, expectedSize: number, limit: number): { data: Buffer; nextOff: number } {
-  let hi = Math.min(limit, off + expectedSize + 64);
-  let data: Buffer | null = null;
-  while (hi <= limit) {
-    try {
-      data = zlib.inflateSync(buf.subarray(off, hi));
-      break;
-    } catch {
-      if (hi === limit) throw new Error('zlib stream is truncated');
-      hi = Math.min(limit, off + (hi - off) * 2);
-    }
-  }
-  if (data === null) throw new Error('zlib stream is truncated');
-  // Binary-search the minimal succeeding end between off+1 and hi.
-  let lo = off + 1;
-  let end = hi;
-  while (lo < end) {
-    const mid = Math.trunc((lo + end) / 2);
-    try {
-      const trial = zlib.inflateSync(buf.subarray(off, mid));
-      if (trial.length === expectedSize) { end = mid; data = trial; }
-      else if (trial.length < expectedSize) lo = mid + 1;
-      else end = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  if (data.length !== expectedSize) throw new Error('inflated size mismatch');
-  return { data, nextOff: end };
+// Inflate exactly one zlib stream starting at `off`. A single streaming
+// inflate consumes only that stream's bytes; `bytesWritten` reports exactly
+// how many input bytes it consumed, so no binary search is needed (the old
+// binary-search version did ~11 inflates per object, which dominated the
+// push workload under CPU contention).
+export function inflateExact(buf: Buffer, off: number, expectedSize: number): Promise<{ data: Buffer; nextOff: number }> {
+  return new Promise((resolve, reject) => {
+    const inf = zlib.createInflate();
+    const chunks: Buffer[] = [];
+    inf.on('data', (c: Buffer) => { chunks.push(c); });
+    inf.on('error', reject);
+    inf.on('end', () => {
+      const data = Buffer.concat(chunks);
+      if (data.length !== expectedSize) {
+        reject(new Error(`inflated size mismatch: got ${data.length}, want ${expectedSize}`));
+        return;
+      }
+      resolve({ data, nextOff: off + inf.bytesWritten });
+    });
+    inf.write(buf.subarray(off));
+    inf.end();
+  });
 }
 
 // Parse a packfile. Resolves ofs/ref deltas against objects in the same pack
 // (and, when supplied, against objects the client already holds).
-export function parsePack(pack: Buffer, haveObjects?: Map<string, GitObject>): Map<string, GitObject> {
+export async function parsePack(pack: Buffer, haveObjects?: Map<string, GitObject>): Promise<Map<string, GitObject>> {
   if (pack.length < 32 || pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('not a pack');
   const count = pack.readUInt32BE(8);
-  const limit = pack.length - 20; // trailer is the last 20 bytes
   let off = 12;
   const objects = new Map<string, GitObject>();
   const offsetToOid = new Map<number, string>();
@@ -279,7 +267,7 @@ export function parsePack(pack: Buffer, haveObjects?: Map<string, GitObject>): M
       baseOid = pack.subarray(off, off + 20).toString('hex');
       off += 20;
     }
-    const { data, nextOff } = inflateExact(pack, off, size, limit);
+    const { data, nextOff } = await inflateExact(pack, off, size);
     off = nextOff;
     if (typeCode >= 1 && typeCode <= 4) {
       const type = CODE_TYPE[typeCode] as ObjType;
@@ -1040,7 +1028,7 @@ export function handleUploadPack(repo: Repo, body: Buffer, res: http.ServerRespo
   sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
 
-export function handleReceivePack(store: Store, repo: Repo, body: Buffer, res: http.ServerResponse): void {
+export async function handleReceivePack(store: Store, repo: Repo, body: Buffer, res: http.ServerResponse): Promise<void> {
   const { lines, packStart } = scanPktLines(body);
   const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
   for (const line of lines) {
@@ -1055,7 +1043,7 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer, res: h
     try {
       const pack = body.subarray(packStart);
       if (pack.length >= 12) {
-        const objects = parsePack(pack);
+        const objects = await parsePack(pack);
         for (const [oid, obj] of objects) {
           if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
         }
@@ -2943,7 +2931,7 @@ export function createApp(): http.Server {
             return;
           }
           if (tail === 'git-receive-pack' && req.method === 'POST') {
-            handleReceivePack(store, repo, body, res);
+            await handleReceivePack(store, repo, body, res);
             return;
           }
         }
