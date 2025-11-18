@@ -2091,7 +2091,7 @@ export function pullGql(pull: Pull, repo: Repo): Record<string, unknown> {
     baseRefName: pull.baseRef,
     headRef: { name: pull.headRef, target: { oid: pull.headSha } },
     baseRef: { name: pull.baseRef, target: { oid: pull.baseSha } },
-    mergeable: pullMergeable(repo, pull),
+    mergeable: pullMergeable(repo, pull) ? 'MERGEABLE' : 'CONFLICTING',
     merged: pull.merged,
     mergeCommit: pull.mergeCommitSha ? { oid: pull.mergeCommitSha } : null,
     files: {
